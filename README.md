@@ -12,9 +12,24 @@ The stack contains:
 - **docker-compose.yml** — runs the app, Prometheus and Grafana together
 - **prometheus/** — Prometheus scrape configuration
 - **grafana/** — provisioned datasource and a "Service Overview" dashboard
-- **.github/workflows/ci.yml** — GitHub Actions pipeline (install, test, build, smoke test)
+- **.github/workflows/ci.yml** — GitHub Actions pipeline (install, test, build, smoke test, full-stack integration checks)
 
 Everything runs locally and for free. No cloud account or billing is required.
+
+## Integration gaps identified and fixes
+
+The failure was caused by configuration mismatches across components, not by a
+single application-code defect:
+
+| Component | Original integration gap | Fix |
+|---|---|---|
+| GitHub Actions | CI used Node.js 12 although the package requires Node.js 18 or newer; dependencies were not installed before tests. | Use Node.js 20 and install dependencies before running tests. |
+| CI smoke test | The app defaults to maintenance mode, which makes `/health` return HTTP 503. | Start the smoke-test container with `MAINTENANCE_MODE=off`. |
+| Docker Compose | Host port mapping and health check did not match the app's container port (3000). | Map host port 8080 to container port 3000 and check port 3000 inside the container. |
+| App configuration | Maintenance mode default prevented a healthy readiness response. | Set `MAINTENANCE_MODE=off` explicitly in the local Compose service. |
+| Prometheus | Scrape path was `/prometheus` and target port was 9090, neither of which is the app's metrics endpoint. | Scrape `http://app:3000/metrics`. |
+| Grafana | The Prometheus datasource used port 9091, while Prometheus listens on 9090. | Point the datasource at `http://prometheus:9090`. |
+| End-to-end validation | The original CI did not check the Compose stack, Prometheus target, or provisioned Grafana dashboard together. | Add a full-stack integration job to the PR workflow to check app health, metrics, scrape target, a Prometheus query, and Grafana datasource/dashboard APIs. |
 
 ## Prerequisites
 
@@ -78,12 +93,18 @@ cd ..
 docker compose config
 ```
 
-## GitHub Actions
+## GitHub Actions and automated evidence
 
 The workflow runs on pushes and pull requests. It installs dependencies on
-Node.js 20, runs the unit tests, builds the Docker image, starts the container
-with the service's health check enabled, and verifies that the metrics endpoint
-returns Prometheus metrics.
+Node.js 20, runs the unit tests, builds and smoke-tests the image, then starts
+the complete Compose stack. The integration job checks app health and metrics,
+the Prometheus target and query API, and the Grafana datasource and dashboard
+API. If integration checks fail, it prints Compose service logs to help locate
+the failing boundary.
+
+A passing CI integration job is automated evidence for the checks above. It
+does not replace screenshots of the local dashboard or a separate rollback
+demonstration.
 
 ## Rollback readiness
 
@@ -109,8 +130,9 @@ curl -fsS http://localhost:8080/health
 ```
 
 Confirm the app is healthy and the Prometheus target returns to **UP** after
-the rollback. These commands describe the rollback procedure; run them locally
-to capture evidence for your PR.
+the rollback. Capture before/after terminal output and dashboard/target
+screenshots. Do not claim rollback success until these commands have actually
+been run and the recovery observed.
 
 ## Cloud release mapping (documentation only)
 
