@@ -1,68 +1,124 @@
 #!/usr/bin/env bash
-# Verify image rollback: a known-good release is replaced by a candidate image
-# that exits at startup, then the known-good image is restored.
-set -euo pipefail
+# Test rollback of the Compose-managed app while Prometheus and Grafana stay up.
+# The EXIT trap attempts recovery even when an assertion fails mid-test.
+set -Eeuo pipefail
 
-GOOD_IMAGE="${1:-ci-container-monitoring-lab:local}"
-CANDIDATE_IMAGE="${2:-ci-container-monitoring-lab:candidate}"
-PORT="${ROLLBACK_TEST_PORT:-18080}"
-BASE_URL="http://127.0.0.1:${PORT}"
-GOOD_CONTAINER="rollback-known-good"
-CANDIDATE_CONTAINER="rollback-candidate"
+GOOD_IMAGE="${GOOD_IMAGE:-ci-container-monitoring-lab:local}"
+CANDIDATE_IMAGE="${CANDIDATE_IMAGE:-ci-container-monitoring-lab:candidate}"
+APP_URL="${APP_URL:-http://127.0.0.1:8080}"
+PROM_URL="${PROM_URL:-http://127.0.0.1:9090}"
+GRAFANA_URL="${GRAFANA_URL:-http://127.0.0.1:3000}"
+EVIDENCE_DIR="${EVIDENCE_DIR:-evidence}"
+CANDIDATE_DEPLOYED=false
+ROLLBACK_COMPLETE=false
+mkdir -p "$EVIDENCE_DIR"
 
-cleanup() {
-  docker rm -f "$GOOD_CONTAINER" "$CANDIDATE_CONTAINER" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-wait_for_health() {
-  for attempt in $(seq 1 20); do
-    if curl --silent --fail "$BASE_URL/health" >/dev/null; then
-      echo "Known-good release is healthy (HTTP 200)"
-      return 0
+wait_for_app_healthy() {
+  for attempt in $(seq 1 30); do
+    container_id="$(docker compose ps -q app 2>/dev/null || true)"
+    if [[ -n "$container_id" ]]; then
+      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+      if [[ "$health" == "healthy" ]] && curl --silent --fail "$APP_URL/health" >/dev/null; then
+        echo "Compose app is healthy (container $container_id)"
+        return 0
+      fi
     fi
-    sleep 2
+    sleep 3
   done
-  echo "Known-good release did not become healthy"
-  docker logs "$GOOD_CONTAINER" 2>/dev/null || true
+  docker compose ps -a || true
+  docker compose logs --no-color app || true
   return 1
 }
 
-# Verify the currently deployable image before testing the failed candidate.
-docker run -d --name "$GOOD_CONTAINER" -p "${PORT}:3000" \
-  -e MAINTENANCE_MODE=off "$GOOD_IMAGE" >/dev/null
-wait_for_health
-docker rm -f "$GOOD_CONTAINER" >/dev/null
+wait_for_prometheus_up() {
+  for attempt in $(seq 1 30); do
+    result="$(curl --silent --fail "$PROM_URL/api/v1/query?query=up%7Bjob%3D%22ci-container-monitoring-lab%22%7D" || true)"
+    if echo "$result" | jq -e '.data.result[0].value[1] == "1"' >/dev/null 2>&1; then
+      echo "Prometheus reports the Compose app target UP"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "Prometheus target did not return to UP"
+  return 1
+}
 
-# Build a deliberately broken candidate image that exits during startup.
-docker build -f scripts/Dockerfile.rollback-candidate -t "$CANDIDATE_IMAGE" .
-docker run -d --name "$CANDIDATE_CONTAINER" -p "${PORT}:3000" "$CANDIDATE_IMAGE" >/dev/null
+restore_known_good() {
+  echo "Restoring known-good image $GOOD_IMAGE on the Compose app service"
+  APP_IMAGE="$GOOD_IMAGE" APP_RESTART_POLICY=unless-stopped docker compose up -d --no-build --force-recreate app
+  wait_for_app_healthy
+}
 
-# A failed release must terminate; do not mistake a running but unready app for success.
-for attempt in $(seq 1 20); do
-  state="$(docker inspect --format '{{.State.Status}}' "$CANDIDATE_CONTAINER")"
-  if [[ "$state" == "exited" ]]; then
+on_exit() {
+  status=$?
+  trap - EXIT
+  if [[ "$CANDIDATE_DEPLOYED" == "true" && "$ROLLBACK_COMPLETE" != "true" ]]; then
+    echo "Test exited before completing rollback; attempting automatic Compose recovery"
+    set +e
+    restore_known_good
+    recovery_status=$?
+    if [[ $recovery_status -eq 0 ]]; then
+      wait_for_prometheus_up
+      recovery_status=$?
+    fi
+    echo "Automatic recovery exit status: $recovery_status"
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+
+# Confirm the stack is healthy and build the known-good image used for rollback.
+wait_for_app_healthy
+curl --silent --show-error --fail "$PROM_URL/-/ready" >/dev/null
+curl --silent --show-error --fail "$GRAFANA_URL/api/health" > "$EVIDENCE_DIR/grafana-health-before-rollback.json"
+docker compose ps -a | tee "$EVIDENCE_DIR/compose-before-rollback.txt"
+APP_IMAGE="$GOOD_IMAGE" docker compose build app
+
+# Build a test-only candidate that exits non-zero during startup.
+docker build --build-arg "BASE_IMAGE=$GOOD_IMAGE" -f scripts/Dockerfile.rollback-candidate -t "$CANDIDATE_IMAGE" .
+echo "Deploying intentionally faulty image into the existing Compose app service"
+APP_IMAGE="$CANDIDATE_IMAGE" APP_RESTART_POLICY=no docker compose up -d --no-build --force-recreate app
+CANDIDATE_DEPLOYED=true
+
+# Verify that the Compose-managed app container really exited non-zero.
+container_id="$(docker compose ps -aq app)"
+if [[ -z "$container_id" ]]; then
+  echo "Could not find the Compose-managed candidate container"
+  exit 1
+fi
+failed=false
+for attempt in $(seq 1 30); do
+  state="$(docker inspect --format '{{.State.Status}}' "$container_id")"
+  exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$container_id")"
+  if [[ "$state" == "exited" && "$exit_code" != "0" ]]; then
+    failed=true
     break
   fi
-  sleep 1
+  sleep 2
 done
-if [[ "$state" != "exited" ]]; then
-  echo "Faulty candidate unexpectedly remained running (state: $state)"
-  docker logs "$CANDIDATE_CONTAINER" || true
+if [[ "$failed" != "true" ]]; then
+  echo "Candidate did not fail as expected (state=$state exit_code=$exit_code)"
+  docker compose logs --no-color app || true
   exit 1
 fi
-exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$CANDIDATE_CONTAINER")"
-if [[ "$exit_code" == "0" ]]; then
-  echo "Faulty candidate exited successfully; expected a non-zero exit code"
-  exit 1
-fi
-echo "Faulty candidate failed as expected (container exit code $exit_code)"
-docker logs "$CANDIDATE_CONTAINER" || true
-docker rm -f "$CANDIDATE_CONTAINER" >/dev/null
+echo "Compose candidate failed as expected (exit code $exit_code)"
+docker inspect "$container_id" > "$EVIDENCE_DIR/failed-compose-candidate.json"
+docker compose ps -a | tee "$EVIDENCE_DIR/compose-candidate-failed.txt"
 
-# Roll back by deploying the previously verified known-good image again.
-docker run -d --name "$GOOD_CONTAINER" -p "${PORT}:3000" \
-  -e MAINTENANCE_MODE=off "$GOOD_IMAGE" >/dev/null
-wait_for_health
+# Roll back the SAME Compose app service to the previously verified image.
+restore_known_good
+wait_for_prometheus_up
+curl --silent --show-error --fail "$GRAFANA_URL/api/health" | tee "$EVIDENCE_DIR/grafana-health-after-rollback.json"
+curl --silent --show-error --fail "$GRAFANA_URL/api/search?query=Service%20Overview" \
+  | jq -e 'any(.[]; .title == "Service Overview")' \
+  | tee "$EVIDENCE_DIR/grafana-dashboard-after-rollback.json"
+curl --silent --show-error --fail "$GRAFANA_URL/api/datasources/proxy/uid/prometheus/api/v1/query?query=up%7Bjob%3D%22ci-container-monitoring-lab%22%7D" \
+  | jq -e '.data.result[0].value[1] == "1"' \
+  | tee "$EVIDENCE_DIR/grafana-prometheus-query-after-rollback.json"
+curl --silent --show-error --fail "$GRAFANA_URL/api/datasources/proxy/uid/prometheus/api/v1/query?query=http_requests_total" \
+  | jq -e '.data.result | length > 0' \
+  | tee "$EVIDENCE_DIR/grafana-live-metrics-after-rollback.json"
+docker compose ps -a | tee "$EVIDENCE_DIR/compose-after-rollback.txt"
 
-echo "Rollback smoke test passed: failed candidate image replaced by the known-good image."
+ROLLBACK_COMPLETE=true
+echo "Compose rollback passed: candidate failed, known-good app recovered, Prometheus UP, Grafana dashboard and live metrics verified."
